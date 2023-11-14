@@ -1,0 +1,54 @@
+SET CPU SIMHALT, IDLE=INFOSERVER
+
+;
+; Set the path to the library of images here
+;
+SET ENV lib_path=/path/to/library/files
+
+;
+; Attach the NVRAM so that the boot flags can be saved
+;
+ATTACH NVR %sysname%.nvr
+;
+ATTACH XS %eth0_name%
+;
+; Setup SCSI devices. Disable any units that are not required or the
+; installation will take a long time to complete as it waits for
+; the units to be ready.
+;
+SET RZ0 DISA
+SET RZ1 %dtype%  ; System disk
+SET RZ2 RZ24  ; CD-ROM - see note below
+SET RZ3 RZ24
+SET RZ4 RZ24
+SET RZ5 DISA
+; SCSI ID 6 is the initiator so is always disabled
+SET RZ7 DISa
+
+; Disable all SCSI units on the second controller
+;
+SET RZB0 RRD40
+SET RZB1 RRD40
+SET RZB2 RRD40
+SET RZB3 RRD40
+SET RZB4 RRD40
+SET RZB5 RRD40
+; SCSI ID 6 is the initiator so is always disabled
+SET RZB7 DISA
+
+; Create a new disk image for the system disk
+;
+ATTACH RZ1 %sysname%.%dtype%
+
+; Attach the CD-ROM to the VAX/VMS V7.3 distribution
+ 
+ATTACH -R RZ2 %lib_path%/vms/VAXVMS073OS.iso
+;ATTACH -R RZ3 %lib_path%/vms/pakgen.iso
+ATTACH -R RZ4 %lib_path%/vaxhaven/VAXDOCDEC07-AG-RWPTM-BE.iso
+
+; Start the simulator
+;
+EXPECT ">>> " SEND "boot\r"; GO
+BOOT CPU
+RM .LOCKED
+EXIT

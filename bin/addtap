@@ -1,0 +1,157 @@
+#!/bin/bash
+#! addtap - add a tap device for simh use
+#!
+#! Copyright © 2023 by Charles P Guldenschuh
+#! All rights reserved.
+#!
+#! addtap creates a tap device for use by simh emulated systems
+#! that is bridged to the main ethernet controller of the host
+#! system.  This allows the host system and the emulated system
+#! to communicate via the network.
+#!
+#! Version  Who     Date        Change
+#!
+PROGVERSION="X0.0.3"
+
+usage() {
+    echo "${progname} [-n] [-d] <tapname> <user> [<ifname>]"
+    echo "${progname} [-v] | [-h]"
+    echo ""
+    echo "  <tapname>   name of the tap device to create"
+    echo "  <user>      name/UID of the user who owns the device"
+    echo "  <ifname>    name of the ethernet device to bridge"
+    echo ""
+    echo "    -n|--dryrun   don't execute commands"
+    echo "    -v|--version  print program version and exit"
+    echo "    -d|--debug    set -x"
+    echo "    -h|--help     this text"
+    exit 1
+}
+
+exithandle() {
+    if [ "${tempfile}" != "" ]; then rm -rf ${tempfile}; fi
+    if [ "${tmpdir}" != "" ];   then rm -rf ${tmpdir}; fi
+}
+
+trap exithandle EXIT
+
+progname=$0
+
+#!
+#! Process command line
+#!
+OPTIONS="nvdh"
+LONGOPT="dryrun,version,debug,help"
+PARSED=$(getopt --options=${OPTIONS} --longoptions=${LONGOPT} --name "$0" -- "$@")
+if [ $? -ne 0 ]; then
+    exit 2
+fi
+
+EXEC=""
+
+eval set -- "${PARSED}"
+while true; do
+    case "$1" in
+    --)
+        shift
+        break
+        ;;
+    -n|--dryrun)
+        EXEC="echo "
+        shift
+        ;;
+    -v|--version)
+        echo ${PROGVERSION}
+        exit 0
+        ;;
+    -d|--debug)
+        set -x
+        shift
+        ;;
+    -h|--help|*)
+        usage
+        ;;
+    esac
+done
+
+#!
+#! Command processing
+#!
+EDEVICE=""
+
+if [ $# -lt 2 -o $# -gt 3 ]; then
+    usage
+    exit 1
+fi
+
+if [ $# -ge 2 ]; then
+    TNAME=$1
+    TUSER=$2
+    if [ $# -eq 3 ]; then
+        EDEVICE=$3
+    fi
+fi
+
+#!
+#! Must be root or in dry-run mode
+#!
+[ $EUID -ne 0 -a "$EXEC" == "" ] && echo "${progname}: Must be run as root" >&2 && exit 1
+
+#!
+#! get_bridgedev    get the ethernet device to bridge
+#! also sets:
+#!  HOSTIP  - ip address of the interface being bridged
+#!  HOSTBA  - broadcast address of interface being briged
+#!  HOSTGW  - gateway address of interface being bridged
+#!
+get_bridgedev() {
+    if [ "${EDEVICE}" == "" ]; then
+        #! No device yet. Get list of devs with routes
+        UPDEVS=`(ip route list | grep -Po 'default.*dev \K\w+')`
+        count=`(echo ${UPDEVS} | wc -w)`
+        if [ ${count} -ne 1 ]; then
+            for x in ${UPDEVS}; do
+                grep -q ${x} /proc/net/wireless
+                if [ $? -eq 1 ]; then
+                    EDEVICE="${x} ${EDEVICE}"
+                fi
+            done
+            count=`(echo ${EDEVICE} | wc -w)`
+            if [ ${count} -ne 1 ]; then
+                echo "${progname}: Cannot determine device to bridge; specify on command line"
+                echo "${progname}:   devices: ${EDEVICE}"
+                exit 3
+            fi
+        else
+            EDEVICE=${UPDEVS}
+        fi
+    fi
+    HOSTIP=`(ip -o -4 address show dev ${EDEVICE} | grep -Po 'inet \K\w+\.\w+\.\w+\.\w+/\w+')`
+    HOSTBA=`(ip -o -4 address show dev ${EDEVICE} | grep -Po 'brd \K\w+\.\w+\.\w+\.\w+')`
+    HOSTGW=`(ip route list dev ${EDEVICE} | grep -Po '^default via \K\w+\.\w+\.\w+\.\w+')`
+}
+
+#!
+#! If the bridge does not already exist, create it.
+#!
+BRIDGE=${BRIDGE:-"br0"}
+ip address show dev ${BRIDGE} >/dev/null 2>&1
+if [ $? != 0 ]; then
+    get_bridgedev
+    if [ "${EDEVICE}" = "" ]; then
+        echo "no bridge yet"
+        exit 3
+    fi
+    ${EXEC} ip link add ${BRIDGE} type bridge 
+    ${EXEC} ip link set ${EDEVICE} master ${BRIDGE}
+    ${EXEC} ip address delete ${HOSTIP} dev ${EDEVICE}
+    ${EXEC} ip link set ${BRIDGE} up
+    ${EXEC} ip address add ${HOSTIP} broadcast ${HOSTBA} dev ${BRIDGE}
+    ${EXEC} ip route add default via ${HOSTGW} dev ${BRIDGE}
+fi
+
+${EXEC} ip tuntap add ${TNAME} mode tap user ${TUSER}
+${EXEC} ip link set ${TNAME} up
+${EXEC} ip link set ${TNAME} master ${BRIDGE}
+#${EXEC} ip address add 0.0.0.0 dev ${TNAME}
+exit 0
