@@ -10,8 +10,10 @@
 #! to communicate via the network.
 #!
 #! Version  Who     Date        Change
+#! X0.0.4   cpg	    2004/05/02	kill dhclient running on primary eth port when
+#!				creating bridge (Debian bookworm)
 #!
-PROGVERSION="X0.0.3"
+PROGVERSION="X0.0.4"
 
 usage() {
     echo "${progname} [-n] [-d] <tapname> <user> [<ifname>]"
@@ -143,6 +145,12 @@ if [ $? != 0 ]; then
         exit 3
     fi
     ${EXEC} ip link add ${BRIDGE} type bridge 
+    ps aux | grep dhclient | grep -q ${EDEVICE}
+    if [ $? == 0 ]; then
+	if [ -e /run/dhclient.${EDEVICE}.pid ]; then
+    	    ${EXEC} kill -9 $(cat /run/dhclient.${EDEVICE}.pid) 2>/dev/null
+    	fi
+    fi
     ${EXEC} ip link set ${EDEVICE} master ${BRIDGE}
     ${EXEC} ip address delete ${HOSTIP} dev ${EDEVICE}
     ${EXEC} ip link set ${BRIDGE} up
