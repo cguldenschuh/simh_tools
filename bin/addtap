@@ -9,11 +9,22 @@
 #! system.  This allows the host system and the emulated system
 #! to communicate via the network.
 #!
-#! Version  Who     Date        Change
-#! X0.0.4   cpg	    2004/05/02	kill dhclient running on primary eth port when
-#!				creating bridge (Debian bookworm)
+#! To do:
+#! o If EDEVICE is not part of the bridge, it needs to be added to that bridge
+#! o Should parameters be passed as options? Particularly user and ifname.
+#! o Should there be an option to tear down tap and/or bridge?
 #!
-PROGVERSION="X0.0.4"
+#! Version  Who     Date        Change
+#! X0.0.4   cpg	    2024/05/02	kill dhclient running on primary eth port when
+#!				creating bridge (Debian bookworm)
+#! X0.0.5   cpg	    2024/05/03	Generalize(?) DHCP killing (at least rpi
+#!				bookworm, and Debian bookworm). Need to test
+#!				other distros...
+#! X0.0.6   cpg	    2024/05/03	Add some error checking for iface without addr
+#! X0.0.7   cpg	    2024/05/03	Use nmcli to create bridge, if available
+#! X0.0.8   cpg	    2024/05/07	Fix -eq vs == errors
+#!
+PROGVERSION="X0.0.8"
 
 usage() {
     echo "${progname} [-n] [-d] <tapname> <user> [<ifname>]"
@@ -27,6 +38,11 @@ usage() {
     echo "    -v|--version  print program version and exit"
     echo "    -d|--debug    set -x"
     echo "    -h|--help     this text"
+    echo ""
+    echo "  The bridge interface name can be overridden with BRIDGE=\"ifname\""
+    echo "  on the command line.  Similarly, the connection profile name (for"
+    echo "  NetworkManager systems) is overridden with BRCONN="
+    echo "  The defaults for these are \"br0\" and \"pidpbridge\""
     exit 1
 }
 
@@ -38,6 +54,12 @@ exithandle() {
 trap exithandle EXIT
 
 progname=$0
+#!
+#! Default values; may be overridden on command line with env values, ie
+#! BRIDGE="temp_br0" BRCONN="temp_connection" addtap tap_foo foo
+#!
+BRIDGE=${BRIDGE:-"br0"}
+BRCONN=${BRCONN:-"pidpbridge"}
 
 #!
 #! Process command line
@@ -82,6 +104,9 @@ done
 EDEVICE=""
 
 if [ $# -lt 2 -o $# -gt 3 ]; then
+    echo ""
+    echo "${progname}: invalid command line"
+    echo ""
     usage
     exit 1
 fi
@@ -100,13 +125,13 @@ fi
 [ $EUID -ne 0 -a "$EXEC" == "" ] && echo "${progname}: Must be run as root" >&2 && exit 1
 
 #!
-#! get_bridgedev    get the ethernet device to bridge
+#! get_ifname	get the ethernet device to bridge
 #! also sets:
 #!  HOSTIP  - ip address of the interface being bridged
 #!  HOSTBA  - broadcast address of interface being briged
 #!  HOSTGW  - gateway address of interface being bridged
 #!
-get_bridgedev() {
+get_ifname() {
     if [ "${EDEVICE}" == "" ]; then
         #! No device yet. Get list of devs with routes
         UPDEVS=`(ip route list | grep -Po 'default.*dev \K\w+')`
@@ -129,8 +154,33 @@ get_bridgedev() {
         fi
     fi
     HOSTIP=`(ip -o -4 address show dev ${EDEVICE} | grep -Po 'inet \K\w+\.\w+\.\w+\.\w+/\w+')`
+    if [ $? -ne 0 ]; then
+	echo "${progname}: Interface has no IPV4 address; cannot bridge ${EDEVICE}"
+	exit 3
+    fi
     HOSTBA=`(ip -o -4 address show dev ${EDEVICE} | grep -Po 'brd \K\w+\.\w+\.\w+\.\w+')`
     HOSTGW=`(ip route list dev ${EDEVICE} | grep -Po '^default via \K\w+\.\w+\.\w+\.\w+')`
+}
+
+#!
+#! Generate DHCP disable command to use...
+#! This used to be easy...
+#! If dhclient is in use, kill it
+#! If nmcli is in use, modify so the interface is in manual mode
+#!
+gen_no_dhcp() {
+    NO_DHCP_CMD="echo \"DHCP not in use on ${EDEVICE}\""
+#    if [ -e /usr/bin/nmcli ]; then
+#	DEFCONN=$(nmcli -t connection show --active | grep ${EDEVICE} | cut -d : -f 2 )
+#	NO_DHCP_CMD="nmcli connection modify --temporary ${DEFCONN} method none"
+#    fi
+    ps aux | grep dhclient | grep -q ${EDEVICE}
+    if [ $? -eq 0 ]; then
+	if [ -e /run/dhclient.${EDEVICE}.pid ]; then
+	    DHCPPID=$(cat /run/dhclient.${EDEVICE}.pid)
+	    NO_DHCP_CMD="kill -9 ${DHCPPID} 2>/dev/null"
+    	fi
+    fi
 }
 
 #!
@@ -138,24 +188,27 @@ get_bridgedev() {
 #!
 BRIDGE=${BRIDGE:-"br0"}
 ip address show dev ${BRIDGE} >/dev/null 2>&1
-if [ $? != 0 ]; then
-    get_bridgedev
+if [ $? -ne 0 ]; then
+    get_ifname
     if [ "${EDEVICE}" = "" ]; then
         echo "no bridge yet"
         exit 3
     fi
-    ${EXEC} ip link add ${BRIDGE} type bridge 
-    ps aux | grep dhclient | grep -q ${EDEVICE}
-    if [ $? == 0 ]; then
-	if [ -e /run/dhclient.${EDEVICE}.pid ]; then
-    	    ${EXEC} kill -9 $(cat /run/dhclient.${EDEVICE}.pid) 2>/dev/null
-    	fi
+    #! NetworkManager in use
+    if [ -e /usr/bin/nmcli ]; then
+    	${EXEC} nmcli connection add type bridge con-name ${BRCONN} ifname ${BRIDGE}
+    	${EXEC} nmcli connection add type ethernet con-name pb-slave-${EDEVICE} ifname ${EDEVICE} master ${BRIDGE}
+    	${EXEC} nmcli connection up pb-slave-${EDEVICE}
+    else 
+    	${EXEC} ip link add ${BRIDGE} type bridge 
+    	gen_no_dhcp
+    	${EXEC} ${NO_DHCP_CMD}
+    	${EXEC} ip link set ${EDEVICE} master ${BRIDGE}
+    	${EXEC} ip address delete ${HOSTIP} dev ${EDEVICE}
+    	${EXEC} ip link set ${BRIDGE} up
+    	${EXEC} ip address add ${HOSTIP} broadcast ${HOSTBA} dev ${BRIDGE}
+    	${EXEC} ip route add default via ${HOSTGW} dev ${BRIDGE}
     fi
-    ${EXEC} ip link set ${EDEVICE} master ${BRIDGE}
-    ${EXEC} ip address delete ${HOSTIP} dev ${EDEVICE}
-    ${EXEC} ip link set ${BRIDGE} up
-    ${EXEC} ip address add ${HOSTIP} broadcast ${HOSTBA} dev ${BRIDGE}
-    ${EXEC} ip route add default via ${HOSTGW} dev ${BRIDGE}
 fi
 
 ${EXEC} ip tuntap add ${TNAME} mode tap user ${TUSER}
