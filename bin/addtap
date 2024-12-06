@@ -1,7 +1,7 @@
 #!/bin/bash
 #! addtap - add a tap device for simh use
 #!
-#! Copyright © 2023 by Charles P Guldenschuh
+#! Copyright © 2023-2024 by Charles P Guldenschuh
 #! All rights reserved.
 #!
 #! addtap creates a tap device for use by simh emulated systems
@@ -9,10 +9,11 @@
 #! system.  This allows the host system and the emulated system
 #! to communicate via the network.
 #!
+#! Bugs:
+#! 1. Finds bridges as valid ethernet devices to add to new bridge
+#!
 #! To do:
 #! o If EDEVICE is not part of the bridge, it needs to be added to that bridge
-#! o Should parameters be passed as options? Particularly user and ifname.
-#! o Should there be an option to tear down tap and/or bridge?
 #!
 #! Version  Who     Date        Change
 #! X0.0.4   cpg	    2024/05/02	kill dhclient running on primary eth port when
@@ -23,26 +24,41 @@
 #! X0.0.6   cpg	    2024/05/03	Add some error checking for iface without addr
 #! X0.0.7   cpg	    2024/05/03	Use nmcli to create bridge, if available
 #! X0.0.8   cpg	    2024/05/07	Fix -eq vs == errors
+#! X0.0.9   cpg	    2024/05/13	nmcli commands for tap devices
+#! X0.0.10  cpg     2024/05/13	Make user, ifname, and bridge parmaters options
+#! X0.0.11  cpg     2024/05/13	Add hwaddress to ip link created bridge
+#! X0.0.12  cpg	    2024/05/16	Send all error messages to stderr
+#! X0.0.13  cpg	    2024/06/25	Fix grep searching /etc/passwd for username
+#! X0.0.14  cpg	    2024/07/06	Add version checking inspired by GRC
 #!
-PROGVERSION="X0.0.8"
+VERMAJ=0
+VERMIN=0
+VERPAT=14
+PROGVERSION="X${VERMAJ}.${VERMIN}.${VERPAT}"
 
 usage() {
-    echo "${progname} [-n] [-d] <tapname> <user> [<ifname>]"
+    echo "${progname} [-n] [-d] <tapname> [-o <user>] [-i <ifname>]"
+    echo "            [-b <bridgedev>] [-c <bridgeconnection>]"
+    echo "            [-a <hwaddr>]"
     echo "${progname} [-v] | [-h]"
     echo ""
     echo "  <tapname>   name of the tap device to create"
-    echo "  <user>      name/UID of the user who owns the device"
+    echo "  <user>      name of the user who owns the device"
     echo "  <ifname>    name of the ethernet device to bridge"
     echo ""
     echo "    -n|--dryrun   don't execute commands"
+    echo "    -o|--owner    tap owner (default root)"
+    echo "    -i|--iface    base interface for bridge (default first interface with"
+    echo "                  an IP address"
+    echo "    -b|--bridge   name of the bridge interface (default br0)"
+    echo "    -c|--connection [NetworkManager] bridge connection name"
+    echo "                    (default pidpbridge)"
+    echo "    -a|--hwaddress [NetworkManager] hardware address of the bridge"
+    echo "                   (default aa:00:04:xx:yy:zz last 3 octets of iface)"
     echo "    -v|--version  print program version and exit"
     echo "    -d|--debug    set -x"
     echo "    -h|--help     this text"
     echo ""
-    echo "  The bridge interface name can be overridden with BRIDGE=\"ifname\""
-    echo "  on the command line.  Similarly, the connection profile name (for"
-    echo "  NetworkManager systems) is overridden with BRCONN="
-    echo "  The defaults for these are \"br0\" and \"pidpbridge\""
     exit 1
 }
 
@@ -53,19 +69,33 @@ exithandle() {
 
 trap exithandle EXIT
 
-progname=$0
+check_version() {
+    bname=$(basename ${progname})
+    version="${VERMAJ}.${VERMIN}.${VERPAT}"
+    versionaddr=$(dig @1.1.1.1 +short ${bname}.version.cghome.net | cut -d "." -f 2,3,4)
+    if [ "${version}" \< "${versionaddr}" ]; then
+    	echo "${progname}: Newer version of ${bname} is available." >&2
+    fi
+}
+
+fullname=$0
+progname=$(basename ${fullname})
 #!
-#! Default values; may be overridden on command line with env values, ie
-#! BRIDGE="temp_br0" BRCONN="temp_connection" addtap tap_foo foo
+#! Default values
 #!
 BRIDGE=${BRIDGE:-"br0"}
 BRCONN=${BRCONN:-"pidpbridge"}
+TUSER=${TUSER:-"root"}
+#!
+#! Check if newer version available
+#!
+check_version
 
 #!
 #! Process command line
 #!
-OPTIONS="nvdh"
-LONGOPT="dryrun,version,debug,help"
+OPTIONS="a:b:c:dhi:no:v"
+LONGOPT="hwaddress:,bridge:,connection:,debug,help,iface:,dryrun,owner:,version"
 PARSED=$(getopt --options=${OPTIONS} --longoptions=${LONGOPT} --name "$0" -- "$@")
 if [ $? -ne 0 ]; then
     exit 2
@@ -80,6 +110,26 @@ while true; do
         shift
         break
         ;;
+    -a|--hwaddress)
+	BRADDR=$2
+	shift 2
+	;;
+    -b|--bridge)
+	BRIDGE=$2
+	shift 2
+	;;
+    -c|--connection)
+	BRCONN=$2
+	shift 2
+	;;
+    -i|--iface)
+	EDEVICE=$2
+	shift 2
+	;;
+    -o|--owner)
+	TUSER=$2
+	shift 2
+	;;
     -n|--dryrun)
         EXEC="echo "
         shift
@@ -101,23 +151,17 @@ done
 #!
 #! Command processing
 #!
-EDEVICE=""
 
-if [ $# -lt 2 -o $# -gt 3 ]; then
+if [ $# -lt 1 -o $# -gt 1 ]; then
     echo ""
-    echo "${progname}: invalid command line"
+    echo "${progname}: Invalid command line: missing tap name to create" >&2
     echo ""
     usage
     exit 1
 fi
 
-if [ $# -ge 2 ]; then
-    TNAME=$1
-    TUSER=$2
-    if [ $# -eq 3 ]; then
-        EDEVICE=$3
-    fi
-fi
+TNAME=$1
+TUSERID=$(grep ^${TUSER}\: /etc/passwd | cut -f 3 -d ":")
 
 #!
 #! Must be root or in dry-run mode
@@ -166,19 +210,14 @@ get_ifname() {
 #! Generate DHCP disable command to use...
 #! This used to be easy...
 #! If dhclient is in use, kill it
-#! If nmcli is in use, modify so the interface is in manual mode
 #!
 gen_no_dhcp() {
     NO_DHCP_CMD="echo \"DHCP not in use on ${EDEVICE}\""
-#    if [ -e /usr/bin/nmcli ]; then
-#	DEFCONN=$(nmcli -t connection show --active | grep ${EDEVICE} | cut -d : -f 2 )
-#	NO_DHCP_CMD="nmcli connection modify --temporary ${DEFCONN} method none"
-#    fi
     ps aux | grep dhclient | grep -q ${EDEVICE}
     if [ $? -eq 0 ]; then
 	if [ -e /run/dhclient.${EDEVICE}.pid ]; then
 	    DHCPPID=$(cat /run/dhclient.${EDEVICE}.pid)
-	    NO_DHCP_CMD="kill -9 ${DHCPPID} 2>/dev/null"
+	    NO_DHCP_CMD="kill -9 ${DHCPPID}"
     	fi
     fi
 }
@@ -186,33 +225,77 @@ gen_no_dhcp() {
 #!
 #! If the bridge does not already exist, create it.
 #!
-BRIDGE=${BRIDGE:-"br0"}
 ip address show dev ${BRIDGE} >/dev/null 2>&1
 if [ $? -ne 0 ]; then
     get_ifname
     if [ "${EDEVICE}" = "" ]; then
-        echo "no bridge yet"
+	echo "${progname}: Could not find an ethernet device to bridge" >&2
         exit 3
     fi
+    EDEVHW=$(ip link show ${EDEVICE} | grep link/ | awk '{print $2}' | cut -d ":" -f 4,5,6)
+    BRADDR="aa:00:04:${EDEVHW}"
     #! NetworkManager in use
     if [ -e /usr/bin/nmcli ]; then
-    	${EXEC} nmcli connection add type bridge con-name ${BRCONN} ifname ${BRIDGE}
+    	${EXEC} nmcli connection add type bridge con-name ${BRCONN} ifname ${BRIDGE} \
+		bridge.mac-address ${BRADDR} bridge.stp no \
+		ipv4.method manual ipv4.address ${HOSTIP} ipv4.gateway ${HOSTGW}
+	${EXEC} nmcli connection up ${BRCONN}
     	${EXEC} nmcli connection add type ethernet con-name pb-slave-${EDEVICE} ifname ${EDEVICE} master ${BRIDGE}
     	${EXEC} nmcli connection up pb-slave-${EDEVICE}
     else 
-    	${EXEC} ip link add ${BRIDGE} type bridge 
+    	${EXEC} ip link add ${BRIDGE} type bridge
+	${EXEC} ip link set dev ${BRIDGE} address ${BRADDR}
     	gen_no_dhcp
+    	#${EXEC} ${NO_DHCP_CMD} >/dev/null 2>&1
     	${EXEC} ${NO_DHCP_CMD}
     	${EXEC} ip link set ${EDEVICE} master ${BRIDGE}
     	${EXEC} ip address delete ${HOSTIP} dev ${EDEVICE}
-    	${EXEC} ip link set ${BRIDGE} up
     	${EXEC} ip address add ${HOSTIP} broadcast ${HOSTBA} dev ${BRIDGE}
+    	${EXEC} ip link set ${BRIDGE} up
     	${EXEC} ip route add default via ${HOSTGW} dev ${BRIDGE}
     fi
 fi
 
-${EXEC} ip tuntap add ${TNAME} mode tap user ${TUSER}
-${EXEC} ip link set ${TNAME} up
-${EXEC} ip link set ${TNAME} master ${BRIDGE}
-#${EXEC} ip address add 0.0.0.0 dev ${TNAME}
+if [ -e /usr/bin/nmcli ]; then
+    ${EXEC} nmcli connection add type tun ifname ${TNAME} con-name ${TNAME} mode tap owner ${TUSERID} master ${BRIDGE}
+else
+    ${EXEC} ip tuntap add ${TNAME} mode tap user ${TUSER}
+    ${EXEC} ip link set ${TNAME} up
+    ${EXEC} ip link set ${TNAME} master ${BRIDGE}
+    #${EXEC} ip address add 0.0.0.0 dev ${TNAME}
+fi
 exit 0
+#!
+#! Design notes:
+#! What follows are some design notes (in no particular order) on why
+#! things were done in a particular way. Some of these should probably
+#! be comments inline.
+#!
+#!  1. Hardware address of bridge interface.   I use "aa:00:04" with the last
+#!     3 octets of the ethernet device as the HA for the bridge.  I found that
+#!     the one assigned when the bridge was created to be random and/or
+#!     arbitrary.  This made statically assigning the IP address of the bridge
+#!     with DHCP painful. This way, it is at least deterministic.
+#!
+#!     A possibly better solution would be to set the bridge interface to be
+#!     manually configured and use the ethernet device's IP address info.
+#!
+#!  2. While I found other uses for this script, the original intent was to
+#!     set up a bridge for the use with my PiDP 11/70, that would allow the
+#!     host and the PDP11 OS communicate via the network.  This is why there
+#!     are some PiDP11/70 defaults sprinkled about.
+#!
+#!  3. The gen_no_dhcp is really ugly. Killing the dhclient is really an ugly
+#!     club, but I was really tired of searching the bad docs for a better
+#!     way of doing it.  What was happening was that dhclient would get and
+#!     assign the IP address for the ethernet device, even though it was
+#!     part of the bridge, AND the same address had been assigned to the
+#!     bridge.  This had predictably bad results.
+#!
+#!  4. Need some better error processing/messaging for the command line
+#!     processor.
+#!
+#!  5. Currently always looks for a configured ethernet device to add to the
+#!     bridge.  Possibly should only add ethernet device to bridge if
+#!     specified on the command line with -i|--ifname.
+#!
