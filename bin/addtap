@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #! addtap - add a tap device for simh use
 #!
 #! Copyright © 2023-2024 by Charles P Guldenschuh
@@ -30,16 +30,20 @@
 #! X0.0.12  cpg	    2024/05/16	Send all error messages to stderr
 #! X0.0.13  cpg	    2024/06/25	Fix grep searching /etc/passwd for username
 #! X0.0.14  cpg	    2024/07/06	Add version checking inspired by GRC
+#! X0.0.15  cpg     2024/12/06  Add option to make bridge/tap persistent
+#! X0.0.16  cpg     2024/12/07  Redirect all error message to stderr;
+#! X0.0.17  cpg     2025/12/01  Use "#!/usr/bin/env bash" instead of "#!/bin/bash"
+#!                              Check for prior existance of tap device
 #!
 VERMAJ=0
 VERMIN=0
-VERPAT=14
+VERPAT=16
 PROGVERSION="X${VERMAJ}.${VERMIN}.${VERPAT}"
 
 usage() {
     echo "${progname} [-n] [-d] <tapname> [-o <user>] [-i <ifname>]"
     echo "            [-b <bridgedev>] [-c <bridgeconnection>]"
-    echo "            [-a <hwaddr>]"
+    echo "            [-a <hwaddr>] [-p]"
     echo "${progname} [-v] | [-h]"
     echo ""
     echo "  <tapname>   name of the tap device to create"
@@ -55,6 +59,7 @@ usage() {
     echo "                    (default pidpbridge)"
     echo "    -a|--hwaddress [NetworkManager] hardware address of the bridge"
     echo "                   (default aa:00:04:xx:yy:zz last 3 octets of iface)"
+    echo "    -p|--persistent [NetworkManager] persist bridge/taps over boot"
     echo "    -v|--version  print program version and exit"
     echo "    -d|--debug    set -x"
     echo "    -h|--help     this text"
@@ -86,6 +91,7 @@ progname=$(basename ${fullname})
 BRIDGE=${BRIDGE:-"br0"}
 BRCONN=${BRCONN:-"pidpbridge"}
 TUSER=${TUSER:-"root"}
+SAVECONN="no"
 #!
 #! Check if newer version available
 #!
@@ -94,8 +100,8 @@ check_version
 #!
 #! Process command line
 #!
-OPTIONS="a:b:c:dhi:no:v"
-LONGOPT="hwaddress:,bridge:,connection:,debug,help,iface:,dryrun,owner:,version"
+OPTIONS="a:b:c:dhi:no:pv"
+LONGOPT="hwaddress:,bridge:,connection:,debug,help,iface:,dryrun,owner:,persistent,version"
 PARSED=$(getopt --options=${OPTIONS} --longoptions=${LONGOPT} --name "$0" -- "$@")
 if [ $? -ne 0 ]; then
     exit 2
@@ -130,6 +136,10 @@ while true; do
 	TUSER=$2
 	shift 2
 	;;
+    -p|--persistent)
+        SAVECONN="yes"
+        shift
+        ;;
     -n|--dryrun)
         EXEC="echo "
         shift
@@ -169,6 +179,15 @@ TUSERID=$(grep ^${TUSER}\: /etc/passwd | cut -f 3 -d ":")
 [ $EUID -ne 0 -a "$EXEC" == "" ] && echo "${progname}: Must be run as root" >&2 && exit 1
 
 #!
+#! See if the interface already exists
+#!
+ip link show ${TNAME} >/dev/null 2>&1
+if [ $? -eq 0 ]; then
+    echo "${progname}: Interface already exists: ${TNAME}" >&2
+    exit 4
+fi
+
+#!
 #! get_ifname	get the ethernet device to bridge
 #! also sets:
 #!  HOSTIP  - ip address of the interface being bridged
@@ -189,8 +208,8 @@ get_ifname() {
             done
             count=`(echo ${EDEVICE} | wc -w)`
             if [ ${count} -ne 1 ]; then
-                echo "${progname}: Cannot determine device to bridge; specify on command line"
-                echo "${progname}:   devices: ${EDEVICE}"
+                echo "${progname}: Cannot determine device to bridge; specify on command line" >&2
+                echo "${progname}:   devices: ${EDEVICE}" >&2
                 exit 3
             fi
         else
@@ -199,7 +218,7 @@ get_ifname() {
     fi
     HOSTIP=`(ip -o -4 address show dev ${EDEVICE} | grep -Po 'inet \K\w+\.\w+\.\w+\.\w+/\w+')`
     if [ $? -ne 0 ]; then
-	echo "${progname}: Interface has no IPV4 address; cannot bridge ${EDEVICE}"
+	echo "${progname}: Interface has no IPV4 address; cannot bridge ${EDEVICE}" >&2
 	exit 3
     fi
     HOSTBA=`(ip -o -4 address show dev ${EDEVICE} | grep -Po 'brd \K\w+\.\w+\.\w+\.\w+')`
@@ -238,9 +257,9 @@ if [ $? -ne 0 ]; then
     if [ -e /usr/bin/nmcli ]; then
     	${EXEC} nmcli connection add type bridge con-name ${BRCONN} ifname ${BRIDGE} \
 		bridge.mac-address ${BRADDR} bridge.stp no \
-		ipv4.method manual ipv4.address ${HOSTIP} ipv4.gateway ${HOSTGW}
+		ipv4.address ${HOSTIP} ipv4.gateway ${HOSTGW} save ${SAVECONN}
 	${EXEC} nmcli connection up ${BRCONN}
-    	${EXEC} nmcli connection add type ethernet con-name pb-slave-${EDEVICE} ifname ${EDEVICE} master ${BRIDGE}
+    	${EXEC} nmcli connection add type ethernet con-name pb-slave-${EDEVICE} ifname ${EDEVICE} master ${BRIDGE} save ${SAVECONN}
     	${EXEC} nmcli connection up pb-slave-${EDEVICE}
     else 
     	${EXEC} ip link add ${BRIDGE} type bridge
@@ -257,7 +276,7 @@ if [ $? -ne 0 ]; then
 fi
 
 if [ -e /usr/bin/nmcli ]; then
-    ${EXEC} nmcli connection add type tun ifname ${TNAME} con-name ${TNAME} mode tap owner ${TUSERID} master ${BRIDGE}
+    ${EXEC} nmcli connection add type tun ifname ${TNAME} con-name ${TNAME} mode tap owner ${TUSERID} master ${BRIDGE} save ${SAVECONN}
 else
     ${EXEC} ip tuntap add ${TNAME} mode tap user ${TUSER}
     ${EXEC} ip link set ${TNAME} up
@@ -274,7 +293,7 @@ exit 0
 #!  1. Hardware address of bridge interface.   I use "aa:00:04" with the last
 #!     3 octets of the ethernet device as the HA for the bridge.  I found that
 #!     the one assigned when the bridge was created to be random and/or
-#!     arbitrary.  This made statically assigning the IP address of the bridge
+#!     arbitrary, which made statically assigning the IP address of the bridge
 #!     with DHCP painful. This way, it is at least deterministic.
 #!
 #!     A possibly better solution would be to set the bridge interface to be
@@ -282,8 +301,8 @@ exit 0
 #!
 #!  2. While I found other uses for this script, the original intent was to
 #!     set up a bridge for the use with my PiDP 11/70, that would allow the
-#!     host and the PDP11 OS communicate via the network.  This is why there
-#!     are some PiDP11/70 defaults sprinkled about.
+#!     host and the PDP11 OS communicate via the wired network.  This is why
+#!     there are some PiDP11/70 defaults sprinkled about.
 #!
 #!  3. The gen_no_dhcp is really ugly. Killing the dhclient is really an ugly
 #!     club, but I was really tired of searching the bad docs for a better
